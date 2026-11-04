@@ -12,6 +12,14 @@ Codex agent in its own tmux window and git worktree. You don't write the code yo
 - `agent send <name> "<message>"`: message a worker (answer its question, pass along another worker's result)
 - `agent done <name>`: close a worker once its PR is merged or abandoned
 
+## The user's skills
+
+The user usually drives you with the repo's skills (`.claude/skills/`, written by `agent init`): `/task` (a worker
+that ships a PR), `/session` (an interactive worker the user attaches to), `/quick-task` (a small change pushed
+straight to the base branch), `/tasks` (status) and `/sync` (update the base branch, close finished workers).
+Follow a skill exactly when it's invoked. A PR worker opens a draft PR, gets one Codex review (a `review-<name>`
+worker), does one fix round, marks the PR ready, and the user merges it.
+
 ## Rules
 
 - **Ask first** before running more than 4 workers at once, and before splitting a request into more than 2
