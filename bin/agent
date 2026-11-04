@@ -1,23 +1,49 @@
 #!/usr/bin/env bash
 # agent: run an orchestrator and Claude/Codex workers in tmux, one git worktree per worker.
+if [ -z "${BASH_VERSINFO:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+  echo "agent: needs bash 4 or newer (this is ${BASH_VERSION:-not bash}). macOS: brew install bash" >&2
+  exit 1
+fi
 set -euo pipefail
 
 HERE="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
 ORCH_PROMPT="$HERE/orchestrator/CLAUDE.md"
 STATE_ROOT="${AGENT_STATE_ROOT:-$HOME/.agent-pool}"
-# Extra flags for every claude / codex launch, e.g. AGENT_CLAUDE_ARGS="--permission-mode acceptEdits"
-CLAUDE_ARGS="${AGENT_CLAUDE_ARGS:-}"
-CODEX_ARGS="${AGENT_CODEX_ARGS:-}"
-# Extra flags for workers only, not the orchestrator. AGENT_WORKER_ARGS="" turns them off.
-WORKER_ARGS="${AGENT_WORKER_ARGS---dangerously-skip-permissions}"
-WORKER_CODEX_ARGS="${AGENT_WORKER_CODEX_ARGS---yolo}"
-# Claude sessions join Remote Control (the Claude app) unless AGENT_REMOTE_CONTROL=0
-REMOTE_CONTROL="${AGENT_REMOTE_CONTROL:-1}"
 
 die() { echo "agent: $*" >&2; exit 1; }
 
+# Per-repo settings: <state>/agents-<repo>/config, a bash file sourced here (it wins over the environment).
+load_config() { # session
+  local f="$STATE_ROOT/$1/config"
+  if [[ -f "$f" ]]; then source "$f"; fi
+  settings
+}
+
+settings() { # the AGENT_* settings (README, Settings); called again after a config is loaded
+  # Extra flags for every claude / codex launch, e.g. AGENT_CLAUDE_ARGS="--model sonnet"
+  CLAUDE_ARGS="${AGENT_CLAUDE_ARGS:-}"
+  CODEX_ARGS="${AGENT_CODEX_ARGS:-}"
+  # 1: workers (not the orchestrator) skip permission prompts: claude --dangerously-skip-permissions, codex --yolo
+  SKIP_PERMISSIONS="${AGENT_SKIP_PERMISSIONS:-0}"
+  # Claude sessions join Remote Control (the Claude app) unless AGENT_REMOTE_CONTROL=0
+  REMOTE_CONTROL="${AGENT_REMOTE_CONTROL:-1}"
+  # Claude's usage-limit notice, looked for in the last lines of a window (a guess: see README, Known gaps).
+  LIMIT_RE="${AGENT_LIMIT_RE:-hit your (usage )?limit|usage limit reached|limit reached.{0,20}resets|out of extra usage}"
+  # The watcher: a plain shell loop (no model, no tokens) running rebalance every WATCH_EVERY seconds.
+  AUTO_REBALANCE="${AGENT_AUTO_REBALANCE:-1}"
+  WATCH_EVERY="${AGENT_WATCH_EVERY:-90}"
+}
+
+need() { # command...: die naming the missing ones
+  local missing=() c
+  for c in "$@"; do command -v "$c" >/dev/null || missing+=("$c"); done
+  (( ${#missing[@]} == 0 )) || die "missing: ${missing[*]} (install it; README, Requirements)"
+}
+
 usage() {
   cat <<'EOF'
+agent init [repo]                write the skills (/task /session /quick-task /tasks /sync) into the repo's
+                                 .claude/skills/, filled in from its config (first run: creates the config)
 agent start [account] [repo]     open the repo's tmux session, first bringing back whatever is missing:
                                  the orchestrator and every worker with a worktree, each resuming its chat;
                                  with an account, the orchestrator runs on it (switched over if running)
@@ -50,7 +76,7 @@ config_dir() { # claude config dir for an account; empty for the default
 }
 
 check_account() {
-  [[ "$1" == codex ]] && return
+  [[ "$1" == codex ]] && { need codex; return; }
   local dir; dir="$(config_dir "$1")"
   [[ -z "$dir" || -d "$dir" ]] || die "no profile for '$1': run 'agent profile $1' and log in"
 }
@@ -85,7 +111,7 @@ launch_cmd() { # account
   local account="$1"
   if [[ "$account" == codex ]]; then
     local cargs="$CODEX_ARGS"
-    [[ -n "${L_WORKER:-}" ]] && cargs+=" $WORKER_CODEX_ARGS"
+    [[ -n "${L_WORKER:-}" && "$SKIP_PERMISSIONS" == 1 ]] && cargs+=" --yolo"
     if [[ -n "${L_RESUME:-}" ]]; then printf 'codex resume --last %s' "$cargs"
     else printf 'codex %s "$(cat %q)"' "$cargs" "$L_PROMPT"; fi
     return
@@ -94,7 +120,7 @@ launch_cmd() { # account
   [[ -n "$dir" ]] && env="CLAUDE_CONFIG_DIR=$(printf %q "$dir") "
   # A new worktree asks again for the repo's .mcp.json servers: approve them, it's the same repo.
   local args="$CLAUDE_ARGS --settings '{\"enableAllProjectMcpServers\":true}' "
-  [[ -n "${L_WORKER:-}" ]] && args+="$WORKER_ARGS "
+  [[ -n "${L_WORKER:-}" && "$SKIP_PERMISSIONS" == 1 ]] && args+="--dangerously-skip-permissions "
   [[ -n "${L_SYS:-}" ]] && args+="--append-system-prompt \"\$(cat $(printf %q "$L_SYS"))\" "
   # Remote Control: the session shows up in the Claude app under this name.
   [[ -n "${L_RC:-}" && "$REMOTE_CONTROL" != 0 ]] && args+="--remote-control $(printf %q "$L_RC") "
@@ -230,6 +256,10 @@ cmd_start() { # [account] [repo], either order: an account that isn't a folder h
   [[ -z "$account" ]] || check_account "$account"
   local repo; repo="$(cd "$path" && git rev-parse --show-toplevel)" || die "not a git repo"
   local s="agents-$(basename "$repo")"
+  load_config "$s"
+  command -v gh >/dev/null || echo "agent: gh not found: workers can't open PRs" >&2
+  [[ "$SKIP_PERMISSIONS" != 1 ]] ||
+    echo "agent: workers skip permission prompts (AGENT_SKIP_PERMISSIONS=1; config: $(state_dir "$s")/config)" >&2
   # An account given: the orchestrator runs on it, switching over (same chat) if it's on another.
   [[ -z "$account" ]] || record_account "$s" orchestrator "$account"
   if tmux has-session -t "=$s" 2>/dev/null; then
@@ -323,15 +353,17 @@ cmd_done() {
   [[ "$name" != orchestrator ]] || die "use 'agent orch' for the orchestrator"
   local wt="$STATE_ROOT/worktrees/$(basename "$repo")/$name"
   if [[ -d "$wt" ]]; then
-    # Links the setup hook made show as untracked: ignore them, refuse on anything else.
-    local dirty; dirty="$(git -C "$wt" status --porcelain | grep -vxE '\?\? (build|reference)' || true)"
+    # Untracked symlinks are the setup hook's: ignore them, refuse on anything else.
+    local dirty l; dirty="$(git -C "$wt" status --porcelain | while IFS= read -r l; do
+      [[ "$l" == '?? '* && -L "$wt/${l#?? }" ]] || echo "$l"; done)"
     [[ -z "$dirty" ]] || die "$name has uncommitted changes, not closing:"$'\n'"$dirty"
   fi
   window_exists "$s" "$name" && tmux kill-window -t "$s:$name"
   if [[ -d "$wt" ]]; then
     local hook; hook="$(state_dir "$s")/teardown-worktree"
     [[ -x "$hook" ]] && "$hook" "$wt" "$name" "$repo"
-    git -C "$repo" worktree remove "$wt" || die "couldn't remove $wt"
+    # --force: the check above allowed only untracked symlinks
+    git -C "$repo" worktree remove --force "$wt" || die "couldn't remove $wt"
   fi
   rm -f "$(agents_dir "$s")/$name.account"
   echo "closed $name (branch agent/$name kept)"
@@ -360,9 +392,6 @@ cmd_profile() {
   echo "profile $1: $dir"
   echo "log in once: CLAUDE_CONFIG_DIR=$dir claude   (then /login with the other account)"
 }
-
-# Claude's usage-limit notice, looked for in the last lines of a window.
-LIMIT_RE="${AGENT_LIMIT_RE:-hit your (usage )?limit|usage limit reached|limit reached.{0,20}resets|out of extra usage}"
 
 claude_accounts() { echo a; local d; for d in "$HOME"/.claude-*/; do [[ -d "$d" ]] && basename "$d" | sed 's/^\.claude-//'; done; }
 
@@ -421,10 +450,6 @@ cmd_rebalance() { # move each Claude agent stuck at its usage limit to an accoun
   fi
 }
 
-# The watcher: a plain shell loop (no model, no tokens) running rebalance every WATCH_EVERY seconds.
-AUTO_REBALANCE="${AGENT_AUTO_REBALANCE:-1}"
-WATCH_EVERY="${AGENT_WATCH_EVERY:-90}"
-
 start_watcher() { # session: start its watcher unless one runs (or AGENT_AUTO_REBALANCE=0)
   [[ "$AUTO_REBALANCE" != 0 ]] || return 0
   local s="$1" dir pid; dir="$(state_dir "$s")"; mkdir -p "$dir"
@@ -453,6 +478,45 @@ cmd_watch() { # [--loop | --stop]: start the watcher; --loop is the watcher itse
   esac
 }
 
+cmd_init() { # [repo]: the skill templates in skills/, filled in from the repo's config
+  local repo; repo="$(cd "${1:-.}" && git rev-parse --show-toplevel)" || die "not a git repo"
+  local name; name="$(basename "$repo")"
+  local s="agents-$name" cfg; cfg="$(state_dir "$s")/config"
+  if [[ ! -f "$cfg" ]]; then
+    mkdir -p "$(dirname "$cfg")"
+    cat >"$cfg" <<'EOF'
+# agent-pool settings for this repo: bash, sourced by `agent` (values here win over the environment).
+
+# 1: workers skip permission prompts (claude --dangerously-skip-permissions, codex --yolo), so they run any
+# command without asking. Only for repos and a machine you trust.
+AGENT_SKIP_PERMISSIONS=0
+
+# For `agent init` (fills in the skills). Run `agent init` again after editing.
+REPO_SLUG=""     # GitHub owner/name, e.g. "me/myrepo"
+BASE_BRANCH=""   # PRs target it; /quick-task and /sync push to it, e.g. "main"
+GATE=""          # must pass before every push, e.g. "make test"
+NOTES="- Keep code comments short."   # repo rules and setup for workers, one "- " line each
+EOF
+    echo "wrote $cfg: fill in REPO_SLUG, BASE_BRANCH and GATE, then run 'agent init' again"
+    return
+  fi
+  load_config "$s"
+  local k; for k in REPO_SLUG BASE_BRANCH GATE; do [[ -n "${!k:-}" ]] || die "set $k in $cfg"; done
+  local state="$STATE_ROOT"; [[ "$state" == "$HOME"/* ]] && state="~${state#"$HOME"}"
+  local dir out t
+  for dir in "$HERE"/skills/*/; do
+    out="$repo/.claude/skills/$(basename "$dir")/SKILL.md"
+    [[ -e "$out" ]] && { echo "kept    $out (exists; delete it to regenerate)"; continue; }
+    t="$(<"$dir/SKILL.md")"
+    t="${t//"{{REPO_SLUG}}"/"$REPO_SLUG"}"; t="${t//"{{BASE_BRANCH}}"/"$BASE_BRANCH"}"
+    t="${t//"{{GATE}}"/"$GATE"}"; t="${t//"{{NOTES}}"/"${NOTES:-}"}"; t="${t//"{{SESSION}}"/"$s"}"
+    t="${t//"{{STATE_FILE}}"/"$state/$s/state.md"}"; t="${t//"{{WORKTREES}}"/"$state/worktrees/$name"}"
+    mkdir -p "$(dirname "$out")"; printf '%s\n' "$t" >"$out"
+    echo "wrote   $out"
+  done
+  echo "commit .claude/skills, then 'agent start' and use /task, /session, /quick-task, /tasks, /sync"
+}
+
 cmd_accounts() {
   echo "a      ~/.claude (default)"
   local d
@@ -463,7 +527,18 @@ cmd_accounts() {
   return 0
 }
 
+settings
 case "${1:-}" in
+  start|init) ;; # they load the config of the repo they're given
+  *) if [[ -n "${AGENT_SESSION:-}" ]]; then load_config "$AGENT_SESSION"
+     elif [[ -n "${TMUX:-}" ]]; then load_config "$(tmux display-message -p '#S' 2>/dev/null || true)"; fi ;;
+esac
+
+case "${1:-}" in start|spawn|orch|rebalance|watch) need tmux git claude python3 ;;
+  status|send|done) need tmux git ;; init) need git ;; esac
+
+case "${1:-}" in
+  init) shift; cmd_init "$@" ;;
   start) shift; cmd_start "$@" ;;
   spawn) shift; cmd_spawn "$@" ;;
   status) shift; cmd_status "$@" ;;
