@@ -1,0 +1,479 @@
+#!/usr/bin/env bash
+# agent: run an orchestrator and Claude/Codex workers in tmux, one git worktree per worker.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+ORCH_PROMPT="$HERE/orchestrator/CLAUDE.md"
+STATE_ROOT="${AGENT_STATE_ROOT:-$HOME/.agent-pool}"
+# Extra flags for every claude / codex launch, e.g. AGENT_CLAUDE_ARGS="--permission-mode acceptEdits"
+CLAUDE_ARGS="${AGENT_CLAUDE_ARGS:-}"
+CODEX_ARGS="${AGENT_CODEX_ARGS:-}"
+# Extra flags for workers only, not the orchestrator. AGENT_WORKER_ARGS="" turns them off.
+WORKER_ARGS="${AGENT_WORKER_ARGS---dangerously-skip-permissions}"
+WORKER_CODEX_ARGS="${AGENT_WORKER_CODEX_ARGS---yolo}"
+# Claude sessions join Remote Control (the Claude app) unless AGENT_REMOTE_CONTROL=0
+REMOTE_CONTROL="${AGENT_REMOTE_CONTROL:-1}"
+
+die() { echo "agent: $*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+agent start [account] [repo]     open the repo's tmux session, first bringing back whatever is missing:
+                                 the orchestrator and every worker with a worktree, each resuming its chat;
+                                 with an account, the orchestrator runs on it (switched over if running)
+agent spawn [--no-pr] <account> <name> <task>
+                                 new worktree + tmux window + agent working on <task>; it opens a PR
+                                 when done unless --no-pr (always off for codex)
+agent status                     each worker: account, attached?, PR, last lines
+agent send <name> <message>      type a message into a worker (refused while you're in it)
+agent done <name>                close a worker's window and remove its worktree (branch kept)
+agent orch <account> [--fresh]   restart the orchestrator on another account (same chat; --fresh starts
+                                 a new one that picks up from its state file)
+agent rebalance                  move each Claude agent stuck at its usage limit (orchestrator too) to an
+                                 account that isn't; agents still working stay where they are
+agent watch [--stop]             the background watcher (started by start and spawn): a shell loop that
+                                 runs rebalance every 90 s; AGENT_AUTO_REBALANCE=0 turns it off
+agent profile <account>          create ~/.claude-<account> sharing your setup (then log in)
+agent accounts                   list accounts
+
+accounts: a = your default ~/.claude, any other name = ~/.claude-<name>, codex = Codex CLI
+EOF
+}
+
+# --- accounts --------------------------------------------------------------
+
+config_dir() { # claude config dir for an account; empty for the default
+  case "$1" in
+    a) echo "" ;;
+    *) echo "$HOME/.claude-$1" ;;
+  esac
+}
+
+check_account() {
+  [[ "$1" == codex ]] && return
+  local dir; dir="$(config_dir "$1")"
+  [[ -z "$dir" || -d "$dir" ]] || die "no profile for '$1': run 'agent profile $1' and log in"
+}
+
+# The short id of a live Claude session (background or interactive) in this folder, matching a
+# session id unless "last"; empty when there's none (`claude agents --json`).
+live_session() { # account (unused: every account is checked), folder, session id|last
+  { claude agents --json --cwd "$2" 2>/dev/null || echo "[]"
+    local d; for d in "$HOME"/.claude-*/; do
+      [[ -d "$d" ]] && { CLAUDE_CONFIG_DIR="${d%/}" claude agents --json --cwd "$2" 2>/dev/null || echo "[]"; }
+    done
+  } | python3 -c '
+import json, sys
+want = sys.argv[1]
+sessions, dec, text, i = [], json.JSONDecoder(), sys.stdin.read(), 0
+while True:  # one JSON array per account
+    while i < len(text) and text[i].isspace(): i += 1
+    if i >= len(text): break
+    try: arr, i = dec.raw_decode(text, i)
+    except Exception: break
+    sessions += arr if isinstance(arr, list) else []
+for x in sessions:
+    if x.get("cwd") == sys.argv[2] and (want == "last" or x.get("sessionId") == want):
+        print(x["id"], x.get("pid", "")); break' "$3" "$2" || true
+}
+
+# The command line that starts an agent on an account. Set before calling:
+#   L_PROMPT  file with the first message (a new conversation), or
+#   L_RESUME  a session id to resume, or "last" for the newest conversation in the window's folder
+#   L_SID     optional id for a new conversation; L_SYS system prompt file; L_RC Remote Control name
+launch_cmd() { # account
+  local account="$1"
+  if [[ "$account" == codex ]]; then
+    local cargs="$CODEX_ARGS"
+    [[ -n "${L_WORKER:-}" ]] && cargs+=" $WORKER_CODEX_ARGS"
+    if [[ -n "${L_RESUME:-}" ]]; then printf 'codex resume --last %s' "$cargs"
+    else printf 'codex %s "$(cat %q)"' "$cargs" "$L_PROMPT"; fi
+    return
+  fi
+  local dir env=""; dir="$(config_dir "$account")"
+  [[ -n "$dir" ]] && env="CLAUDE_CONFIG_DIR=$(printf %q "$dir") "
+  # A new worktree asks again for the repo's .mcp.json servers: approve them, it's the same repo.
+  local args="$CLAUDE_ARGS --settings '{\"enableAllProjectMcpServers\":true}' "
+  [[ -n "${L_WORKER:-}" ]] && args+="$WORKER_ARGS "
+  [[ -n "${L_SYS:-}" ]] && args+="--append-system-prompt \"\$(cat $(printf %q "$L_SYS"))\" "
+  # Remote Control: the session shows up in the Claude app under this name.
+  [[ -n "${L_RC:-}" && "$REMOTE_CONTROL" != 0 ]] && args+="--remote-control $(printf %q "$L_RC") "
+  # Still running in the background (its window was closed): open it again, don't start a second copy.
+  # Switching accounts (L_STOP_LIVE=1) stops it instead, so the resume runs on the new account.
+  if [[ -n "${L_RESUME:-}" ]]; then
+    local live id pid; live="$(live_session "$account" "$PWD_OF_WINDOW" "$L_RESUME")"
+    read -r id pid <<<"$live" || true
+    if [[ -n "${id:-}" && "${L_STOP_LIVE:-}" != 1 ]]; then
+      printf '%sclaude attach %s' "$env" "$id"; return
+    elif [[ -n "${pid:-}" ]]; then
+      kill "$pid" 2>/dev/null || true
+      local i; for i in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done
+    fi
+  fi
+  # Conversations live in the shared projects/, so any account can resume any of them.
+  case "${L_RESUME:-}" in
+    "") [[ -n "${L_SID:-}" ]] && args+="--session-id $L_SID "
+        printf '%sclaude %s"$(cat %q)"' "$env" "$args" "$L_PROMPT" ;;
+    last) printf '%sclaude %s--continue' "$env" "$args" ;;
+    *) printf '%sclaude %s--resume %s' "$env" "$args" "$L_RESUME" ;;
+  esac
+}
+
+# --- session ---------------------------------------------------------------
+
+session() {
+  if [[ -n "${AGENT_SESSION:-}" ]]; then echo "$AGENT_SESSION"
+  elif [[ -n "${TMUX:-}" ]]; then tmux display-message -p '#S'
+  else die "not inside tmux; set AGENT_SESSION or run 'agent start'"
+  fi
+}
+
+repo_of() { tmux show-options -t "$1" -v @agent_repo 2>/dev/null || die "session '$1' wasn't made by 'agent start'"; }
+state_dir() { echo "$STATE_ROOT/$1"; }
+
+window_exists() { tmux list-windows -t "$1" -F '#W' | grep -qx "$2"; }
+
+# True when a tmux client is looking at this window: you're working in it.
+attached() { # session, window
+  tmux list-clients -F '#{session_name} #{window_name}' 2>/dev/null | grep -qx "$1 $2"
+}
+
+type_into() { # target, message
+  tmux send-keys -t "$1" -l "$2"
+  sleep 0.3 # let the TUI finish the paste before Enter submits it
+  tmux send-keys -t "$1" Enter
+}
+
+orch_prompt_file() { # session -> file with the orchestrator's first message
+  local s="$1" dir; dir="$(state_dir "$s")"
+  local f="$dir/.orch-prompt"
+  cat >"$f" <<EOF
+You are the orchestrator for $(repo_of "$s").
+Your state file is $dir/state.md: read it now, then tell me where things stand in a few lines.
+EOF
+  echo "$f"
+}
+
+# --- records: what restores an agent after its window (or the whole session) is gone ----
+
+# <state>/agents/<name>.account: the account; orchestrator.session: its conversation id
+# (workers resume the newest conversation in their worktree, which is theirs alone).
+agents_dir() { echo "$(state_dir "$1")/agents"; }
+record_account() { mkdir -p "$(agents_dir "$1")"; echo "$3" >"$(agents_dir "$1")/$2.account"; }
+recorded_account() { # session, name: the record, else the window's option, else a
+  local a
+  a="$(cat "$(agents_dir "$1")/$2.account" 2>/dev/null || true)"
+  [[ -n "$a" ]] || a="$(tmux show-options -w -t "$1:$2" -v @agent_account 2>/dev/null || true)"
+  echo "${a:-a}"
+}
+worktree_of() { echo "$STATE_ROOT/worktrees/$(basename "$(repo_of "$1")")/$2"; }
+
+# Starts a command in a window: the existing one (restarted) or a new one.
+run_in_window() { # session, name, dir, account, command
+  local s="$1" name="$2" dir="$3" account="$4" cmd="$5"
+  if window_exists "$s" "$name"; then
+    tmux respawn-pane -k -t "$s:$name" -c "$dir"
+  else
+    tmux new-window -d -t "$s:" -n "$name" -c "$dir"
+  fi
+  tmux set-option -w -t "$s:$name" @agent_account "$account"
+  tmux send-keys -t "$s:$name" "export AGENT_SESSION=$s PATH=$(printf %q "$HERE/bin"):\$PATH; $cmd" Enter
+}
+
+launch_orchestrator() { # session, account, fresh|""
+  local s="$1" account="$2" fresh="${3:-}" repo; repo="$(repo_of "$s")"
+  local sidfile; sidfile="$(agents_dir "$s")/orchestrator.session"
+  local sid; sid="$(cat "$sidfile" 2>/dev/null || true)"
+  PWD_OF_WINDOW="$repo" L_SYS="$ORCH_PROMPT" L_RC="$(basename "$repo") orchestrator" L_RESUME="" L_SID="" L_PROMPT=""
+  if [[ "$account" == codex ]]; then # codex has no system prompt flag: lead with the instructions
+    L_PROMPT="$(orch_prompt_file "$s").codex"
+    { cat "$ORCH_PROMPT"; echo; cat "$(orch_prompt_file "$s")"; } >"$L_PROMPT"
+  elif [[ -z "$fresh" && -n "$sid" ]]; then
+    L_RESUME="$sid"
+  else
+    sid="$(cat /proc/sys/kernel/random/uuid)"; L_SID="$sid"; L_PROMPT="$(orch_prompt_file "$s")"
+    mkdir -p "$(agents_dir "$s")"; echo "$sid" >"$sidfile"
+  fi
+  record_account "$s" orchestrator "$account"
+  run_in_window "$s" orchestrator "$repo" "$account" "$(launch_cmd "$account")"
+  # Window 0 is the orchestrator's: swap it there if a worker took it.
+  local idx; idx="$(tmux display-message -p -t "$s:orchestrator" '#I')"
+  [[ "$idx" == 0 ]] || tmux swap-window -d -s "$s:orchestrator" -t "$s:0" 2>/dev/null || true
+}
+
+# Brings back what's missing: the orchestrator and every worker whose worktree still exists.
+restore() { # session
+  local s="$1" restored=""
+  window_exists "$s" orchestrator || { launch_orchestrator "$s" "$(recorded_account "$s" orchestrator)"; restored+=" orchestrator"; }
+  local wt name account
+  for wt in "$STATE_ROOT/worktrees/$(basename "$(repo_of "$s")")"/*/; do
+    [[ -d "$wt" ]] || continue
+    name="$(basename "$wt")"
+    window_exists "$s" "$name" && continue
+    account="$(recorded_account "$s" "$name")"
+    L_WORKER=1 PWD_OF_WINDOW="${wt%/}" L_RESUME=last L_RC="$(basename "$(repo_of "$s")") $name" L_SYS="" L_SID="" L_PROMPT=""
+    run_in_window "$s" "$name" "${wt%/}" "$account" "$(launch_cmd "$account")"
+    restored+=" $name"
+  done
+  [[ -z "$restored" ]] || echo "restored:$restored"
+}
+
+# --- commands --------------------------------------------------------------
+
+is_account() { [[ "$1" == a || "$1" == codex || -d "$HOME/.claude-$1" ]]; }
+
+cmd_start() { # [account] [repo], either order: an account that isn't a folder here is the account
+  local account="" path="." arg
+  for arg in "$@"; do
+    if [[ -z "$account" && ! -d "$arg" ]] && is_account "$arg"; then account="$arg"; else path="$arg"; fi
+  done
+  [[ -z "$account" ]] || check_account "$account"
+  local repo; repo="$(cd "$path" && git rev-parse --show-toplevel)" || die "not a git repo"
+  local s="agents-$(basename "$repo")"
+  # An account given: the orchestrator runs on it, switching over (same chat) if it's on another.
+  [[ -z "$account" ]] || record_account "$s" orchestrator "$account"
+  if tmux has-session -t "=$s" 2>/dev/null; then
+    if [[ -n "$account" ]] && window_exists "$s" orchestrator &&
+       [[ "$(tmux show-options -w -t "$s:orchestrator" -v @agent_account 2>/dev/null || true)" != "$account" ]]; then
+      L_STOP_LIVE=1 launch_orchestrator "$s" "$account"
+      echo "orchestrator switched to $account"
+    fi
+  else
+    local dir; dir="$(state_dir "$s")"; mkdir -p "$dir"
+    [[ -f "$dir/state.md" ]] || printf '# Orchestrator state\n\n## Tasks\n\n(none yet)\n' >"$dir/state.md"
+    tmux new-session -d -s "$s" -n orchestrator -c "$repo"
+    tmux set-option -t "$s" @agent_repo "$repo"
+    tmux set-environment -t "$s" AGENT_SESSION "$s"
+    tmux set-environment -t "$s" PATH "$HERE/bin:$PATH"
+    launch_orchestrator "$s" "$(recorded_account "$s" orchestrator)"
+  fi
+  restore "$s"
+  start_watcher "$s"
+  [[ "${AGENT_NO_ATTACH:-}" == 1 ]] && return
+  if [[ -n "${TMUX:-}" ]]; then tmux switch-client -t "$s"; else tmux attach -t "$s"; fi
+}
+
+cmd_spawn() {
+  local ending="When you're done: commit, push the branch and open a PR (gh pr create) with a short summary.
+Then end with one line: DONE <PR url>. If you're blocked, end with: BLOCKED <reason>."
+  local no_pr=""
+  [[ "${1:-}" == --no-pr ]] && { no_pr=1; shift; }
+  [[ "${1:-}" == codex ]] && no_pr=1 # codex workers are reviewers: the task says how it ends
+  [[ -n "$no_pr" ]] && ending="If you're blocked, end with one line: BLOCKED <reason>."
+  [[ $# -ge 3 ]] || die "usage: agent spawn [--no-pr] <account> <name> <task>"
+  local account="$1" name="$2"; shift 2; local task="$*"
+  [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "name: lowercase letters, digits and dashes"
+  [[ "$name" != orchestrator ]] || die "that name is taken"
+  check_account "$account"
+  local s repo; s="$(session)"; repo="$(repo_of "$s")"
+  window_exists "$s" "$name" && die "worker '$name' exists"
+
+  local wt="$STATE_ROOT/worktrees/$(basename "$repo")/$name" branch="agent/$name"
+  mkdir -p "$(dirname "$wt")"
+  git -C "$repo" worktree add -q "$wt" -b "$branch" >/dev/null || die "worktree failed"
+  # Per-repo worktree setup (build dirs, links): <state dir>/setup-worktree <worktree> <name> <repo>
+  local hook; hook="$(state_dir "$s")/setup-worktree"
+  [[ -x "$hook" ]] && { "$hook" "$wt" "$name" "$repo" || die "setup-worktree failed for $wt"; }
+
+  local prompt; prompt="$(state_dir "$s")/.task-$name"
+  cat >"$prompt" <<EOF
+You are worker '$name', in your own git worktree on branch $branch.
+Other agents work in parallel in other worktrees: stay within your task.
+
+Task:
+$task
+
+$ending
+EOF
+  record_account "$s" "$name" "$account"
+  L_WORKER=1 L_PROMPT="$prompt" L_RC="$(basename "$repo") $name" L_RESUME="" L_SID="" L_SYS=""
+  run_in_window "$s" "$name" "$wt" "$account" "$(launch_cmd "$account")"
+  start_watcher "$s"
+  echo "spawned $name ($account) in $wt on $branch"
+}
+
+cmd_status() {
+  local s repo; s="$(session)"; repo="$(repo_of "$s")"
+  local have_gh=; command -v gh >/dev/null && have_gh=1
+  tmux list-windows -t "$s" -F '#W' | while read -r w; do
+    [[ "$w" == orchestrator ]] && continue
+    local account; account="$(tmux show-options -w -t "$s:$w" -v @agent_account 2>/dev/null || echo ?)"
+    local flags=""; attached "$s" "$w" && flags=" [you're in it]"
+    local pr=""
+    [[ -n "$have_gh" ]] && pr="$(cd "$repo" && gh pr list --head "agent/$w" --state all \
+      --json url,state -q '.[0] | "\(.state) \(.url)"' 2>/dev/null || true)"
+    echo "== $w ($account)$flags ${pr:+PR: $pr}"
+    tmux capture-pane -p -t "$s:$w" | grep -v '^[[:space:]]*$' | tail -n "${AGENT_STATUS_LINES:-5}" | sed 's/^/   /'
+  done
+}
+
+cmd_send() {
+  [[ $# -ge 2 ]] || die "usage: agent send <name> <message>"
+  local name="$1"; shift
+  local s; s="$(session)"
+  window_exists "$s" "$name" || die "no worker '$name'"
+  attached "$s" "$name" && die "the user is working in '$name' right now; don't send"
+  type_into "$s:$name" "$*"
+  echo "sent to $name"
+}
+
+cmd_done() {
+  [[ $# -eq 1 ]] || die "usage: agent done <name>"
+  local name="$1" s repo; s="$(session)"; repo="$(repo_of "$s")"
+  [[ "$name" != orchestrator ]] || die "use 'agent orch' for the orchestrator"
+  local wt="$STATE_ROOT/worktrees/$(basename "$repo")/$name"
+  if [[ -d "$wt" ]]; then
+    # Links the setup hook made show as untracked: ignore them, refuse on anything else.
+    local dirty; dirty="$(git -C "$wt" status --porcelain | grep -vxE '\?\? (build|reference)' || true)"
+    [[ -z "$dirty" ]] || die "$name has uncommitted changes, not closing:"$'\n'"$dirty"
+  fi
+  window_exists "$s" "$name" && tmux kill-window -t "$s:$name"
+  if [[ -d "$wt" ]]; then
+    local hook; hook="$(state_dir "$s")/teardown-worktree"
+    [[ -x "$hook" ]] && "$hook" "$wt" "$name" "$repo"
+    git -C "$repo" worktree remove "$wt" || die "couldn't remove $wt"
+  fi
+  rm -f "$(agents_dir "$s")/$name.account"
+  echo "closed $name (branch agent/$name kept)"
+}
+
+cmd_orch() {
+  [[ $# -ge 1 ]] || die "usage: agent orch <account> [--fresh]"
+  local account="$1" fresh="${2:-}"
+  check_account "$account"
+  local s; s="$(session)"
+  [[ "$fresh" == --fresh ]] || fresh=""
+  L_STOP_LIVE=1 launch_orchestrator "$s" "$account" "$fresh"
+  echo "orchestrator restarted on $account"
+}
+
+cmd_profile() {
+  [[ $# -eq 1 ]] || die "usage: agent profile <account>"
+  [[ "$1" != a && "$1" != codex ]] || die "'$1' needs no profile"
+  local dir; dir="$(config_dir "$1")"
+  mkdir -p "$dir"
+  # Everything but the login: instructions, settings, skills, plugins, memory and conversations.
+  local item
+  for item in CLAUDE.md settings.json agents commands skills hooks plugins projects; do
+    [[ -e "$HOME/.claude/$item" && ! -e "$dir/$item" ]] && ln -s "$HOME/.claude/$item" "$dir/$item"
+  done
+  echo "profile $1: $dir"
+  echo "log in once: CLAUDE_CONFIG_DIR=$dir claude   (then /login with the other account)"
+}
+
+# Claude's usage-limit notice, looked for in the last lines of a window.
+LIMIT_RE="${AGENT_LIMIT_RE:-hit your (usage )?limit|usage limit reached|limit reached.{0,20}resets|out of extra usage}"
+
+claude_accounts() { echo a; local d; for d in "$HOME"/.claude-*/; do [[ -d "$d" ]] && basename "$d" | sed 's/^\.claude-//'; done; }
+
+limited_window() { # session, window: its screen ends in the usage-limit notice
+  tmux capture-pane -p -t "$1:$2" | grep -v '^[[:space:]]*$' | tail -n 8 | grep -qiE "$LIMIT_RE"
+}
+
+wait_ready() { # session, window: until the new Claude shows its prompt (up to 90 s)
+  local i; for i in $(seq 90); do
+    tmux capture-pane -p -t "$1:$2" | grep -q '❯' && return 0; sleep 1
+  done; return 1
+}
+
+move_worker() { # session, name, account: resume its chat on the account, then tell it to go on
+  local s="$1" name="$2" account="$3" wt; wt="$(worktree_of "$s" "$name")"
+  [[ -d "$wt" ]] || { echo "  $name: no worktree, skipped"; return; }
+  record_account "$s" "$name" "$account"
+  L_WORKER=1 L_STOP_LIVE=1 PWD_OF_WINDOW="$wt" L_RESUME=last L_RC="$(basename "$(repo_of "$s")") $name" L_SYS="" L_SID="" L_PROMPT=""
+  run_in_window "$s" "$name" "$wt" "$account" "$(launch_cmd "$account")"
+  if attached "$s" "$name"; then echo "  $name -> $account (you're in it: say continue yourself)"
+  elif wait_ready "$s" "$name"; then
+    type_into "$s:$name" "Your account changed after a usage limit. Continue where you left off."
+    echo "  $name -> $account, told to continue"
+  else echo "  $name -> $account (no prompt yet: check it)"; fi
+}
+
+cmd_rebalance() { # move each Claude agent stuck at its usage limit to an account that isn't; others stay put
+  [[ $# -eq 0 ]] || die "usage: agent rebalance"
+  local s; s="$(session)"
+  local -A full=() count=() stuck=()
+  local w a windows=() acct=()
+  while read -r w; do
+    a="$(tmux show-options -w -t "$s:$w" -v @agent_account 2>/dev/null || recorded_account "$s" "$w")"
+    [[ "$a" == codex ]] && continue
+    windows+=("$w"); acct+=("$a")
+    limited_window "$s" "$w" && { full[$a]=1; stuck[$w]=1; }
+  done < <(tmux list-windows -t "$s" -F '#W')
+  (( ${#stuck[@]} )) || { echo "no agent is at its usage limit"; return 0; }
+  local healthy=() h
+  for h in $(claude_accounts); do [[ -n "${full[$h]:-}" ]] || { healthy+=("$h"); count[$h]=0; }; done
+  local names="${!full[*]}"
+  (( ${#healthy[@]} )) || die "every Claude account is at its limit ($names): nothing to move to"
+  local i; for i in "${!windows[@]}"; do [[ -n "${count[${acct[$i]}]+x}" ]] && count[${acct[$i]}]=$(( count[${acct[$i]}] + 1 )); done
+  least() { local b="" x; for x in "${healthy[@]}"; do [[ -z "$b" || ${count[$x]} -lt ${count[$b]} ]] && b="$x"; done; echo "$b"; }
+  echo "at limit: $names; moving its stuck agents to: ${healthy[*]}"
+  local orch=""
+  for w in "${windows[@]}"; do
+    [[ -n "${stuck[$w]:-}" ]] || continue
+    if [[ "$w" == orchestrator ]]; then orch=1; continue; fi
+    h="$(least)"; count[$h]=$(( count[$h] + 1 ))
+    move_worker "$s" "$w" "$h"
+  done
+  if [[ -n "$orch" ]]; then # last, from the tmux server: this may be running inside the orchestrator's pane
+    h="$(least)"; echo "  orchestrator -> $h"
+    tmux run-shell -b "AGENT_SESSION=$s $(printf %q "$HERE/bin/agent") orch $h >/dev/null 2>&1"
+  fi
+}
+
+# The watcher: a plain shell loop (no model, no tokens) running rebalance every WATCH_EVERY seconds.
+AUTO_REBALANCE="${AGENT_AUTO_REBALANCE:-1}"
+WATCH_EVERY="${AGENT_WATCH_EVERY:-90}"
+
+start_watcher() { # session: start its watcher unless one runs (or AGENT_AUTO_REBALANCE=0)
+  [[ "$AUTO_REBALANCE" != 0 ]] || return 0
+  local s="$1" dir pid; dir="$(state_dir "$s")"; mkdir -p "$dir"
+  pid="$(cat "$dir/watch.pid" 2>/dev/null || true)"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0
+  AGENT_SESSION="$s" setsid nohup "$HERE/bin/agent" watch --loop >/dev/null 2>&1 </dev/null &
+  echo $! >"$dir/watch.pid"
+}
+
+cmd_watch() { # [--loop | --stop]: start the watcher; --loop is the watcher itself
+  local s; s="$(session)"; local dir; dir="$(state_dir "$s")"
+  case "${1:-}" in
+    "") start_watcher "$s"; echo "watcher: pid $(cat "$dir/watch.pid" 2>/dev/null), log $dir/rebalance.log" ;;
+    --stop) kill "$(cat "$dir/watch.pid" 2>/dev/null)" 2>/dev/null && echo "watcher stopped" || echo "no watcher" ;;
+    --loop)
+      local out last=""
+      while tmux has-session -t "=$s" 2>/dev/null; do
+        sleep "$WATCH_EVERY"
+        out="$( (cmd_rebalance) 2>&1 || true)"
+        [[ "$out" == "no agent is at its usage limit" ]] && { last=""; continue; }
+        # Log moves; a repeated "every account is at its limit" only once.
+        [[ "$out" != "$last" ]] && printf '%s %s\n' "$(date '+%F %T')" "$out" >>"$dir/rebalance.log"
+        last="$out"
+      done ;;
+    *) die "usage: agent watch [--stop]" ;;
+  esac
+}
+
+cmd_accounts() {
+  echo "a      ~/.claude (default)"
+  local d
+  for d in "$HOME"/.claude-*/; do
+    [[ -d "$d" ]] && echo "$(basename "$d" | sed 's/^\.claude-//')      $d"
+  done
+  command -v codex >/dev/null && echo "codex  Codex CLI"
+  return 0
+}
+
+case "${1:-}" in
+  start) shift; cmd_start "$@" ;;
+  spawn) shift; cmd_spawn "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  send) shift; cmd_send "$@" ;;
+  done) shift; cmd_done "$@" ;;
+  orch) shift; cmd_orch "$@" ;;
+  rebalance) shift; cmd_rebalance "$@" ;;
+  watch) shift; cmd_watch "$@" ;;
+  profile) shift; cmd_profile "$@" ;;
+  accounts) shift; cmd_accounts "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command '$1' (agent help)" ;;
+esac
